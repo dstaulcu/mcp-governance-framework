@@ -39,9 +39,12 @@ graph TB
         CV[Cross-Validator]
         CS[Confidence Scorer]
         CB[Circuit Breaker]
+        SPE[SecurityPolicyEngine<br/>stateless validation]
+        HA[HookAdapter ABC<br/>pre/post tool hooks]
         
         BS --> SC
         BS --> AT
+        BS --> SPE
         AT --> AI
         AT --> HWM
         AT --> CB
@@ -49,20 +52,29 @@ graph TB
         BS --> CE
         BS --> CV
         BS --> CS
+        HA --> SPE
+        HA --> AI
     end
 
     subgraph "Concrete Skills"
         ECS[ExampleConfluenceSkill]
     end
 
+    subgraph "Adapters (optional)"
+        LGHA[LangGraphHookAdapter]
+    end
+
     subgraph "External"
         MCP[MCP Tool Calls]
         LOG[Audit Sink<br/>logging / hash_chain / signed]
+        LG[LangGraph Callbacks]
     end
 
     ECS -->|extends| BS
     ECS -->|@audited_tool| MCP
     AI --> LOG
+    LGHA -->|extends| HA
+    LGHA --> LG
 ```
 
 ### Execution Flow
@@ -195,7 +207,9 @@ class AuditRecord:
 
 ### 3. BaseSkill ABC (`base_skill.py`)
 
-**Validates: Requirements 1, 2, 5, 6, 13, 14, 15, 17, 20**
+**Validates: Requirements 1, 2, 5, 6, 13, 14, 15, 17, 20, 23**
+
+> **Note:** As of Requirement 23, the BaseSkill `execute()` pipeline delegates all reusable validation logic (classification ceiling checks, fragment metadata validation, portion mark enforcement, citation verification, cross-validation) to the `SecurityPolicyEngine` (Component 13) rather than implementing checks inline. This ensures a single source of truth for security policies shared with `HookAdapter` implementations.
 
 ```python
 from abc import ABC, abstractmethod
@@ -237,7 +251,7 @@ class BaseSkill(ABC):
         """
         ...
 
-    # --- Internal pipeline steps ---
+    # --- Internal pipeline steps (delegate to SecurityPolicyEngine) ---
     def _validate_fragments(self, fragments: list[DataFragment]) -> list[DataFragment]: ...
     def _check_classification_ceiling(self, fragment: DataFragment) -> None: ...
     def _apply_security_envelope(self, raw_output: str) -> str: ...
@@ -496,6 +510,270 @@ A markdown file containing:
 - Instruction to apply portion marks to every paragraph (Req 9.5).
 - Security compliance checklist (Req 9.6).
 
+### 13. Security Policy Engine (`security_policy.py`)
+
+**Validates: Requirements 23, 2, 5, 11, 13, 18**
+
+```python
+class SecurityPolicyEngine:
+    """
+    Stateless engine encapsulating all reusable security checks.
+    Both BaseSkill.execute() and HookAdapter methods delegate to this class.
+    All context is passed as parameters — no instance state.
+    """
+
+    @staticmethod
+    def check_classification_ceiling(
+        classification: ClassificationLevel,
+        ceiling: ClassificationLevel,
+        tool_name: str = "",
+        source: str = "",
+    ) -> None:
+        """
+        Raises ClassificationCeilingExceededError if classification > ceiling.
+        """
+        ...
+
+    @staticmethod
+    def validate_fragment_metadata(fragment: DataFragment) -> None:
+        """
+        Validates that a DataFragment has:
+        - A valid classification field (ClassificationMissingError / ClassificationInvalidError)
+        - A source field with non-empty title and system (SourceMissingError)
+        - A confidence value in [0.0, 1.0] (ValueError)
+        """
+        ...
+
+    @staticmethod
+    def validate_portion_marks(text: str, hwm: ClassificationLevel) -> None:
+        """
+        Validates that every paragraph's portion mark does not exceed the HWM.
+        Raises ClassificationExceedsHWMError on violation.
+        """
+        ...
+
+    @staticmethod
+    def validate_citations(text: str, fragments: list[DataFragment]) -> None:
+        """
+        Validates that every paragraph referencing retrieved data contains
+        at least one inline citation.
+        """
+        ...
+
+    @staticmethod
+    def cross_validate_marks_and_citations(
+        text: str,
+        fragments: list[DataFragment],
+    ) -> None:
+        """
+        Cross-validates that each paragraph's portion mark >= max classification
+        of cited sources. Raises ClassificationMarkCitationMismatchError on violation.
+        """
+        ...
+```
+
+#### Design Rationale
+
+- **Stateless**: All methods are `@staticmethod` — no `__init__`, no instance variables. Context (user_context, HWM, fragments) is passed as parameters. This makes the engine trivially testable and safe to share across threads.
+- **Single source of truth**: Previously, validation logic lived inline in `BaseSkill._validate_fragments()`, `_check_classification_ceiling()`, `_enforce_portion_marks()`, etc. Now those methods delegate to `SecurityPolicyEngine`, and `HookAdapter` methods call the same engine. A policy change in one place applies everywhere (Req 23.4).
+- **Same exception types**: The engine raises the same `BaseSkillError` subclasses (`ClassificationCeilingExceededError`, `SourceMissingError`, etc.) regardless of whether it's called from `BaseSkill.execute()` or from a `HookAdapter` (Req 23.6).
+
+### 14. Hook Adapter Interface (`hooks.py`)
+
+**Validates: Requirements 21**
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Optional
+
+@dataclass
+class HookDecision:
+    allow: bool
+    reason: str
+    modified_arguments: Optional[dict] = None
+    modified_result: Optional[Any] = None
+
+class HookAdapter(ABC):
+    """
+    Abstract interface for orchestrator-level pre/post tool hooks.
+    Delegates all security checks to SecurityPolicyEngine.
+    Logs decisions via AuditInterceptor.
+    
+    No orchestrator-specific imports in this module.
+    """
+
+    def __init__(
+        self,
+        policy_engine: SecurityPolicyEngine,
+        audit_interceptor: AuditInterceptor,
+    ): ...
+
+    @abstractmethod
+    def pre_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict,
+        user_context: UserContext,
+    ) -> HookDecision:
+        """
+        Called before a tool executes.
+        - Delegates ceiling check to SecurityPolicyEngine.check_classification_ceiling()
+        - Returns HookDecision with allow=False if ceiling exceeded
+        - Logs HOOK_ALLOW or HOOK_DENY via AuditInterceptor
+        """
+        ...
+
+    @abstractmethod
+    def post_tool_call(
+        self,
+        tool_name: str,
+        result: Any,
+        user_context: UserContext,
+    ) -> HookDecision:
+        """
+        Called after a tool executes.
+        - Delegates metadata validation to SecurityPolicyEngine.validate_fragment_metadata()
+        - Returns HookDecision with allow=False if validation fails
+        - Logs HOOK_ALLOW or HOOK_DENY via AuditInterceptor
+        """
+        ...
+
+    @abstractmethod
+    def on_execution_complete(
+        self,
+        response: str,
+        user_context: UserContext,
+    ) -> HookDecision:
+        """
+        Called after the full execution pipeline completes.
+        - Delegates portion mark validation to SecurityPolicyEngine.validate_portion_marks()
+        - Delegates citation validation to SecurityPolicyEngine.validate_citations()
+        - Returns HookDecision with allow=False if compliance fails
+        - Logs HOOK_ALLOW or HOOK_DENY via AuditInterceptor
+        """
+        ...
+
+    def _log_decision(
+        self,
+        tool_name: str,
+        decision: HookDecision,
+        user_context: UserContext,
+    ) -> None:
+        """
+        Logs HOOK_ALLOW or HOOK_DENY via self._audit_interceptor.
+        Status is "HOOK_ALLOW" if decision.allow else "HOOK_DENY".
+        Includes tool_name, decision.reason, and user_context.user_id.
+        """
+        ...
+```
+
+#### Design Rationale
+
+- **No orchestrator imports**: `hooks.py` imports only from the core framework (`SecurityPolicyEngine`, `AuditInterceptor`, `UserContext`, `HookDecision`). This satisfies Req 21.6.
+- **Delegation, not duplication**: Hook methods call `SecurityPolicyEngine` for all checks rather than reimplementing validation logic. This ensures policy consistency (Req 23.3-4).
+- **Audit logging**: Every hook invocation produces an audit record with `HOOK_ALLOW` or `HOOK_DENY` status (Req 21.7). The `_log_decision()` helper is a concrete method on the ABC to avoid duplicating logging logic in every adapter.
+
+### 15. LangGraph Hook Adapter (`adapters/langgraph.py`)
+
+**Validates: Requirements 22**
+
+```python
+# base_skill_framework/adapters/langgraph.py
+# Lazy import: LangGraph is NOT imported at module level.
+
+class LangGraphHookAdapter(HookAdapter):
+    """
+    Concrete adapter translating HookAdapter methods into LangGraph callbacks.
+    
+    Import path: base_skill_framework.adapters.langgraph
+    LangGraph is lazily imported so the core package never requires it.
+    """
+
+    def __init__(
+        self,
+        policy_engine: SecurityPolicyEngine,
+        audit_interceptor: AuditInterceptor,
+    ):
+        super().__init__(policy_engine, audit_interceptor)
+        # Lazy import of LangGraph at instantiation time
+        self._langchain_core = _lazy_import_langchain_core()
+
+    def pre_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict,
+        user_context: UserContext,
+    ) -> HookDecision:
+        """
+        Translates to LangGraph on_tool_start callback.
+        1. Extracts expected classification from arguments (if present)
+        2. Delegates ceiling check to SecurityPolicyEngine
+        3. Logs decision
+        4. Returns HookDecision
+        """
+        ...
+
+    def post_tool_call(
+        self,
+        tool_name: str,
+        result: Any,
+        user_context: UserContext,
+    ) -> HookDecision:
+        """
+        Translates to LangGraph on_tool_end callback.
+        1. Delegates metadata validation to SecurityPolicyEngine
+        2. Logs decision
+        3. Returns HookDecision
+        """
+        ...
+
+    def on_execution_complete(
+        self,
+        response: str,
+        user_context: UserContext,
+    ) -> HookDecision:
+        """
+        Translates to LangGraph on_chain_end callback.
+        1. Delegates portion mark + citation validation to SecurityPolicyEngine
+        2. Logs decision
+        3. Returns HookDecision
+        """
+        ...
+
+    def as_langraph_callbacks(self, user_context: UserContext) -> dict:
+        """
+        Returns a dict of LangGraph callback handlers that carry
+        user_context via LangGraph config/metadata.
+        
+        Keys: on_tool_start, on_tool_end, on_chain_end
+        Each callback wraps the corresponding hook method, injecting
+        user_context from the LangGraph RunnableConfig metadata.
+        """
+        ...
+
+
+def _lazy_import_langchain_core():
+    """
+    Lazily imports langchain_core. Raises ImportError with a helpful
+    message if LangGraph/langchain-core is not installed.
+    """
+    try:
+        import langchain_core
+        return langchain_core
+    except ImportError:
+        raise ImportError(
+            "LangGraphHookAdapter requires 'langchain-core'. "
+            "Install it with: pip install langchain-core"
+        )
+```
+
+#### Design Rationale
+
+- **Lazy import**: `langchain_core` is imported inside `_lazy_import_langchain_core()`, called only at `LangGraphHookAdapter.__init__()` time. The core `base_skill_framework` package never touches LangGraph (Req 22.7).
+- **Optional subpackage**: Lives under `base_skill_framework/adapters/langgraph.py`. The `adapters/` directory can host future adapters (e.g., CrewAI, AutoGen) without polluting the core namespace (Req 22.6).
+- **user_context via config/metadata**: `as_langraph_callbacks()` returns callback handlers that inject `user_context` into LangGraph's `RunnableConfig.metadata` dict, making it available throughout the callback chain (Req 22.5).
+
 
 ## Data Models
 
@@ -559,7 +837,7 @@ class AuditRecord:
     metadata: dict                                    # Extensible key-value pairs
 ```
 
-Status values: `STARTED`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CEILING_VIOLATION`, `PARTIAL_FAILURE`, `CB_STATE_CHANGE`
+Status values: `STARTED`, `COMPLETED`, `FAILED`, `TIMEOUT`, `CEILING_VIOLATION`, `PARTIAL_FAILURE`, `CB_STATE_CHANGE`, `HOOK_ALLOW`, `HOOK_DENY`
 
 ### UserContext Schema
 
@@ -711,6 +989,18 @@ Per-tool state stored in a `dict[str, ToolCircuitState]` within the `CircuitBrea
 
 **Validates: Requirements 20.1, 20.3, 20.4, 20.5**
 
+### Property 18: SecurityPolicyEngine consistency
+
+*For any* input (classification level and ceiling pair, data fragment, response text with portion marks, or response text with citations), the `SecurityPolicyEngine` shall raise the same exception types and produce the same validation outcomes whether called from `BaseSkill.execute()` or from a `HookAdapter` method. Equivalently, *for any* two calls to the same `SecurityPolicyEngine` static method with identical parameters, the results (return value or raised exception) shall be identical, confirming statelessness.
+
+**Validates: Requirements 23.2, 23.3, 23.5, 23.6**
+
+### Property 19: HookAdapter decision logging
+
+*For any* hook invocation (`pre_tool_call`, `post_tool_call`, or `on_execution_complete`) on any `HookAdapter` implementation, the adapter shall produce exactly one audit record with a status of either `HOOK_ALLOW` or `HOOK_DENY`, including the tool name, the decision reason, and the `user_context.user_id`.
+
+**Validates: Requirements 21.7**
+
 
 ## Error Handling
 
@@ -803,7 +1093,7 @@ The BaseSkill framework is well-suited for property-based testing because it con
 
 **Tag format**: Each test tagged with `# Feature: base-skill-framework, Property {N}: {title}`
 
-**Properties to implement** (17 total, mapped to design properties):
+**Properties to implement** (19 total, mapped to design properties):
 
 | Property | Test Focus | Key Generators |
 |---|---|---|
@@ -824,6 +1114,8 @@ The BaseSkill framework is well-suited for property-based testing because it con
 | 15: Cross-validation | Mark ≥ max cited source classification | Paragraphs with marks + cited sources at various levels |
 | 16: Circuit breaker state machine | State transitions follow the defined FSM | Random sequences of success/failure calls |
 | 17: Empty result well-formed | Default response has banner, mark, appendix, confidence 0.0 | Random `default_classification` + empty/whitespace strings |
+| 18: SecurityPolicyEngine consistency | Same exceptions from both call paths; stateless (identical inputs → identical outputs) | Random `DataFragment` + random `ClassificationLevel` pairs, called via both `BaseSkill` and `HookAdapter` paths |
+| 19: HookAdapter decision logging | Every hook invocation produces HOOK_ALLOW or HOOK_DENY audit record | Random tool names + random `UserContext` + random arguments/results |
 
 ### Unit Tests (Example-Based)
 
@@ -839,12 +1131,23 @@ Unit tests complement property tests by covering:
 - **Confidence disclaimer content**: Verify disclaimer text format when aggregate < threshold (Req 12.5)
 - **Response banner format**: Verify `// OVERALL CLASSIFICATION: <HWM> //` format (Req 3.4)
 - **Empty result structure**: Verify all structural elements present (Req 20.2, 20.4)
+- **HookAdapter abstract enforcement**: Verify `HookAdapter` cannot be instantiated directly and subclasses missing methods raise `TypeError` (Req 21.1)
+- **HookDecision dataclass fields**: Verify `HookDecision` construction with required and optional fields (Req 21.2)
+- **HookAdapter no orchestrator imports**: Verify `hooks.py` does not import orchestrator-specific modules (Req 21.6)
+- **LangGraphHookAdapter extends HookAdapter**: Verify class hierarchy and instantiation (Req 22.1)
+- **LangGraph lazy import**: Verify core `base_skill_framework` imports without LangGraph installed (Req 22.7)
+- **LangGraph optional subpackage**: Verify import from `base_skill_framework.adapters.langgraph` (Req 22.6)
+- **SecurityPolicyEngine interface**: Verify all specified methods exist and are static (Req 23.1)
 
 ### Integration Tests
 
 - **Full pipeline execution**: `ExampleConfluenceSkill.execute()` with mock MCP tool returning various classification levels, verifying the complete output structure (banner + portion marks + citations + appendix + confidence).
 - **Graceful degradation end-to-end**: Execute with some MCP tools failing, verify partial results with degraded sources section.
 - **Circuit breaker integration**: Simulate consecutive failures, verify circuit opens, wait for recovery, verify probe behavior.
+- **BaseSkill delegates to SecurityPolicyEngine**: Mock `SecurityPolicyEngine`, verify `BaseSkill.execute()` calls its methods for ceiling checks, fragment validation, portion marks, citations, and cross-validation (Req 23.2).
+- **HookAdapter delegates to SecurityPolicyEngine**: Mock `SecurityPolicyEngine`, verify `HookAdapter` methods call the same engine methods (Req 23.3).
+- **LangGraph callback translation**: Mock LangGraph callbacks, verify `LangGraphHookAdapter` translates `pre_tool_call` → `on_tool_start`, `post_tool_call` → `on_tool_end`, `on_execution_complete` → `on_chain_end` (Req 22.2-4).
+- **LangGraph user_context propagation**: Verify `user_context` is stored in and retrievable from LangGraph `RunnableConfig.metadata` (Req 22.5).
 
 ### Test File Organization
 
@@ -862,6 +1165,9 @@ tests/
 ├── test_cross_validation.py    # Property 15 + unit tests
 ├── test_circuit_breaker.py     # Property 16 + unit tests
 ├── test_empty_result.py        # Property 17 + unit tests
+├── test_security_policy.py     # Property 18 (SecurityPolicyEngine consistency) + unit tests
+├── test_hooks.py               # Property 19 (HookAdapter decision logging) + unit tests
+├── test_langgraph_adapter.py   # LangGraphHookAdapter integration tests
 ├── test_confluence_skill.py    # ExampleConfluenceSkill integration
 └── test_steering_file.py       # Steering file content verification
 ```

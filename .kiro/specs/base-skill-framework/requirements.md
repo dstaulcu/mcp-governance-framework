@@ -38,6 +38,10 @@ This document defines the requirements for a BaseSkill framework designed for hi
 - **ToolTimeoutError**: An exception raised when a method decorated with `@audited_tool` exceeds its configured `timeout_seconds` limit.
 - **CircuitBreakerOpenError**: An exception raised when a call is made to a tool whose circuit breaker is in the open state, indicating the tool has exceeded its consecutive failure threshold.
 - **circuit_breaker**: A resilience mechanism that tracks consecutive failures for each tool and temporarily blocks further calls after a configurable failure threshold is reached, allowing recovery after a timeout period.
+- **HookAdapter**: An abstract interface defining orchestrator-agnostic hook methods (`pre_tool_call`, `post_tool_call`, `on_execution_complete`) that translate BaseSkill security policies into orchestrator-level pre/post tool callbacks, enabling dual-layer enforcement without coupling the framework to any specific orchestrator.
+- **HookDecision**: A dataclass returned by HookAdapter methods containing: `allow` (bool), `reason` (str), `modified_arguments` (optional dict for pre-hook argument rewriting), and `modified_result` (optional for post-hook result filtering), representing the outcome of a hook evaluation.
+- **SecurityPolicyEngine**: A stateless class that encapsulates all reusable security checks (classification ceiling, fragment metadata validation, portion mark compliance, citation completeness, cross-validation) in a single location, callable by both the BaseSkill execution pipeline and any HookAdapter implementation.
+- **LangGraphHookAdapter**: A concrete implementation of HookAdapter that translates the abstract hook interface into LangGraph-specific callbacks (`on_tool_start`, `on_tool_end`, `on_chain_end`), provided as an optional subpackage to avoid coupling the core framework to LangGraph.
 
 ## Requirements
 
@@ -289,3 +293,44 @@ This document defines the requirements for a BaseSkill framework designed for hi
 3. IF `format_response()` receives an empty or whitespace-only string, THEN THE BaseSkill SHALL generate a default response: "(<default_classification_mark>) No results were found for the given query."
 4. THE default empty response SHALL include the Response_Banner, a Portion_Mark, and an empty Sources_Appendix.
 5. THE Aggregate_Confidence for an empty result SHALL be 0.0, and a Confidence_Disclaimer SHALL always be prepended for empty results.
+
+### Requirement 21: Orchestrator Hook Adapter Interface (Abstract)
+
+**User Story:** As a platform architect, I want the BaseSkill framework's security policies (classification ceiling, audit logging, portion mark enforcement) to be enforceable at the orchestrator level via pre/post tool hooks, so that guardrails are applied at both the code layer and the platform layer without coupling the framework to any specific orchestrator.
+
+#### Acceptance Criteria
+
+1. THE BaseSkill framework SHALL define an abstract HookAdapter interface with methods: `pre_tool_call(tool_name, arguments, user_context) -> HookDecision`, `post_tool_call(tool_name, result, user_context) -> HookDecision`, and `on_execution_complete(response, user_context) -> HookDecision`.
+2. THE HookDecision SHALL be a dataclass containing: `allow` (bool), `reason` (str), `modified_arguments` (optional dict for pre-hook argument rewriting), and `modified_result` (optional for post-hook result filtering).
+3. WHEN `pre_tool_call` is invoked, THE HookAdapter SHALL enforce classification ceiling checks by inspecting the tool's expected classification level against `user_context.clearance_level` and SHALL reject calls that would exceed the ceiling by returning a HookDecision with `allow=False`.
+4. WHEN `post_tool_call` is invoked, THE HookAdapter SHALL validate that the tool result contains required metadata fields (`classification`, `source`, `confidence`) and SHALL reject results that fail validation by returning a HookDecision with `allow=False`.
+5. WHEN `on_execution_complete` is invoked, THE HookAdapter SHALL scan the final response for portion mark compliance and citation completeness.
+6. THE HookAdapter interface SHALL NOT import or depend on any orchestrator-specific library.
+7. WHEN a hook method returns a HookDecision, THE HookAdapter SHALL log the decision via the Audit_Interceptor with a status of "HOOK_ALLOW" or "HOOK_DENY" including the tool name, the decision reason, and the user_context.user_id.
+
+### Requirement 22: LangGraph Hook Adapter (Reference Implementation)
+
+**User Story:** As a platform engineer, I want a concrete adapter that translates the BaseSkill hook interface into LangGraph callbacks, so that the security guardrails work within a LangGraph-based orchestration pipeline.
+
+#### Acceptance Criteria
+
+1. THE BaseSkill framework SHALL provide a LangGraphHookAdapter class that extends HookAdapter and implements all three hook methods (`pre_tool_call`, `post_tool_call`, `on_execution_complete`).
+2. THE LangGraphHookAdapter SHALL translate `pre_tool_call` into a LangGraph `on_tool_start` callback that receives the tool name and input arguments.
+3. THE LangGraphHookAdapter SHALL translate `post_tool_call` into a LangGraph `on_tool_end` callback that receives the tool output.
+4. THE LangGraphHookAdapter SHALL translate `on_execution_complete` into a LangGraph `on_chain_end` callback.
+5. THE LangGraphHookAdapter SHALL carry user_context through the LangGraph callback chain via LangGraph's config/metadata mechanism.
+6. THE LangGraphHookAdapter SHALL be importable from an optional subpackage (e.g., `base_skill_framework.adapters.langgraph`) so that the core framework does not require LangGraph as a dependency.
+7. IF LangGraph is not installed, THEN importing the core `base_skill_framework` package SHALL NOT raise an ImportError.
+
+### Requirement 23: Orchestrator-Agnostic Security Policy Engine
+
+**User Story:** As a platform architect, I want the security policy logic (ceiling checks, metadata validation, portion mark scanning) to live in a single place that both the BaseSkill and any HookAdapter can call, so that policies are defined once and enforced everywhere.
+
+#### Acceptance Criteria
+
+1. THE BaseSkill framework SHALL provide a SecurityPolicyEngine class that encapsulates all reusable security checks: `check_classification_ceiling(classification, ceiling)`, `validate_fragment_metadata(fragment)`, `validate_portion_marks(text, hwm)`, `validate_citations(text, fragments)`, and `cross_validate_marks_and_citations(text, fragments)`.
+2. THE BaseSkill `execute()` pipeline SHALL delegate its validation logic to the SecurityPolicyEngine rather than implementing checks inline.
+3. THE HookAdapter interface methods SHALL delegate their validation logic to the same SecurityPolicyEngine instance used by the BaseSkill.
+4. WHEN a policy change is made to the SecurityPolicyEngine (e.g., adding a new required metadata field), THE change SHALL automatically apply to both the BaseSkill code path and the orchestrator hook path without requiring duplicate modifications.
+5. THE SecurityPolicyEngine SHALL be stateless — all required context (user_context, hwm, fragments) SHALL be passed as method parameters.
+6. THE SecurityPolicyEngine SHALL raise the same exception types as the BaseSkill (e.g., ClassificationCeilingExceededError, SourceMissingError) so that error handling is consistent across both enforcement layers.
